@@ -1,20 +1,19 @@
 'use strict';
 /**
- * Patrice — AI Phone Receptionist for Taylor MD Formulations
- * Handles inbound calls to +17064089670
+ * Patrice — AI Phone Receptionist for Taylor MD Formulations v2.0
+ * Twilio: +1 (706) 408-9670  |  Business: 678-443-4099
+ * Voice only — SMS handled via RingCentral
  *
- * Capabilities:
- *  - Product questions (full catalog knowledge)
- *  - Order status lookup via ShipStation API
- *  - Shipping policy, returns policy
- *  - Dr. Taylor's books
+ * v2.0 changes:
+ *  - Zero dead ends: every unresolved path gives info@taylormdformulations.com + 48h follow-up
+ *  - 3-tier pricing: Retail / Registered Customer ($5 off on $50+) / Practitioner
+ *  - Loyalty program talking points
+ *  - No-input counter (3 strikes → graceful goodbye with email)
+ *  - Human request → email + 48h (not just website link)
+ *  - All gather() calls followed by redirect (no more hangup after gather)
  *  - Post-call summary email to staff
- *
- * Does NOT:
- *  - Transfer calls to humans
- *  - Share physical address or directions
- *  - Accept sales calls (redirects to email)
- *  - Operate as a medical practice (retail supplements only)
+ *  - Practitioner / wholesale intent detection
+ *  - Review reward talking point
  */
 
 require('dotenv').config();
@@ -42,16 +41,18 @@ const CONFIG = {
   resend: {
     apiKey: process.env.RESEND_API_KEY,
   },
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY,
+  },
   email: {
     from:    'Patrice at Taylor MD Formulations <noreply@taylormdformulations.com>',
-    staffTo: ['infotaylormdformulations@gmail.com'],
+    staffTo: ['info@taylormdformulations.com', 'ebtaylormd@gmail.com'],
   },
   brand: {
     name:        'Taylor MD Formulations',
     website:     'taylormdformulations.com',
     contactPage: 'taylormdformulations.com/contact',
     staffEmail:  'info@taylormdformulations.com',
-    phone:       '678-443-4099',
   },
 };
 
@@ -60,10 +61,20 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 // ─── SESSION STORE ────────────────────────────────────────────────────────────
 const sessions = {};
 function getSession(callSid) {
-  if (!sessions[callSid]) sessions[callSid] = { callLog: [], conversationHistory: [] };
+  if (!sessions[callSid]) {
+    sessions[callSid] = {
+      callLog: [],
+      conversationHistory: [],
+      callerPhone: '',
+      noInputCount: 0,
+      _startTime: Date.now(),
+    };
+  }
   return sessions[callSid];
 }
-function clearSession(callSid) { delete sessions[callSid]; }
+function clearSession(callSid) {
+  setTimeout(() => { delete sessions[callSid]; }, 300000);
+}
 
 // Prune sessions older than 2 hours
 setInterval(() => {
@@ -96,10 +107,22 @@ function gather(twiml, action, opts = {}) {
   });
 }
 
+let _twilioClient = null;
 function getTwilioClient() {
-  const { accountSid, authToken } = CONFIG.twilio;
-  if (!accountSid || !authToken) return null;
-  return twilio(accountSid, authToken);
+  if (!_twilioClient && CONFIG.twilio.accountSid?.startsWith('AC')) {
+    _twilioClient = twilio(CONFIG.twilio.accountSid, CONFIG.twilio.authToken);
+  }
+  return _twilioClient;
+}
+
+// ─── DEAD-END HANDLER ─────────────────────────────────────────────────────────
+// Called whenever Patrice cannot resolve a request
+function deadEndMessage() {
+  return (
+    "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com — " +
+    "that's info at taylor M D formulations dot com — and a member of our team will follow up with you within 48 hours. " +
+    "Is there anything else I can help you with today?"
+  );
 }
 
 // ─── EMAIL (RESEND) ───────────────────────────────────────────────────────────
@@ -113,7 +136,10 @@ async function sendEmail(subject, htmlBody, textBody) {
       subject,
       html: htmlBody,
       text: textBody,
-    }, { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: 10000 });
+    }, {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
     console.log('[EMAIL] Sent:', r.data?.id);
     return true;
   } catch (err) {
@@ -122,7 +148,7 @@ async function sendEmail(subject, htmlBody, textBody) {
   }
 }
 
-async function sendCallSummary(callerPhone, summary, callSid = null) {
+async function sendCallSummary(callerPhone, summary) {
   const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   const text = `📋 TMD Call Summary — ${now} ET\n📱 Caller: ${callerPhone}\n─────────────────────\n${summary}`;
   const html = `
@@ -134,7 +160,7 @@ async function sendCallSummary(callerPhone, summary, callSid = null) {
       <div style="background:#f7fafc;padding:16px;border-radius:8px;white-space:pre-wrap;font-size:14px;">
         ${summary.replace(/\n/g, '<br>')}
       </div>
-      <p style="color:#718096;font-size:12px;margin-top:16px;">Sent by Patrice — Taylor MD Formulations AI Receptionist</p>
+      <p style="color:#718096;font-size:12px;margin-top:16px;">Sent by Patrice — Taylor MD Formulations AI Receptionist v2.0</p>
     </div>`;
   await sendEmail(`TMD Call Summary — ${now} ET | Caller: ${callerPhone}`, html, text).catch(() => {});
 }
@@ -144,6 +170,18 @@ function ssAuth() {
   const { apiKey, apiSecret } = CONFIG.shipstation;
   if (!apiKey || !apiSecret) return null;
   return 'Basic ' + Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
+}
+
+function formatStatus(status) {
+  const map = {
+    awaiting_payment:  'Awaiting Payment',
+    awaiting_shipment: 'Processing — preparing to ship',
+    shipped:           'Shipped',
+    on_hold:           'On Hold',
+    cancelled:         'Cancelled',
+    delivered:         'Delivered',
+  };
+  return map[status] || status || 'Processing';
 }
 
 async function lookupOrderByEmail(email) {
@@ -193,78 +231,106 @@ async function lookupOrderByNumber(orderNumber) {
   }
 }
 
-function formatStatus(status) {
-  const map = {
-    awaiting_payment: 'Awaiting Payment',
-    awaiting_shipment: 'Processing — preparing to ship',
-    shipped: 'Shipped',
-    on_hold: 'On Hold',
-    cancelled: 'Cancelled',
-    delivered: 'Delivered',
-  };
-  return map[status] || status || 'Processing';
-}
-
-// ─── PRODUCT CATALOG (KNOWLEDGE BASE) ────────────────────────────────────────
+// ─── PRODUCT CATALOG — 3-TIER PRICING ────────────────────────────────────────
 const PRODUCT_CATALOG = `
-TAYLOR MD FORMULATIONS — LIVE PRODUCT CATALOG (as of 2026)
+TAYLOR MD FORMULATIONS — PRODUCT CATALOG v2.0
+
+PRICING TIERS:
+- Retail: Standard price for all website visitors at taylormdformulations.com
+- Registered Customer (My Account): $5 off per product on orders of $50 or more — create a free account at taylormdformulations.com
+- Practitioner/Wholesale: Contact info@taylormdformulations.com for practitioner pricing
 
 ADRENAL SUPPORT:
-- AdrenaCare™ ($69.95): Restore Your Adrenal Function. Reclaim Your Energy. Helps with: adrenal fatigue, burnout, low energy, chronic stress, adrenal exhaustion, cortisol depletion
-- SerenCalm™ ($38.95): Lower Cortisol. Clear Brain Fog. Think Sharper. Helps with: high cortisol, brain fog, anxiety, stress, poor memory, scattered thinking, mental clarity
-- Stress B Complex™ ($37.95): The B Vitamins Your Stressed Body Is Burning Through. Helps with: stress, fatigue, B vitamin deficiency, low energy, nerve pain, mood issues, anxiety, depression
+- AdrenaCare™ | Retail: $72.95 | Customer (on $50+ order): $67.95
+  Restore Your Adrenal Function. Helps with: adrenal fatigue, burnout, low energy, chronic stress, cortisol depletion
+- SerenCalm™ | Retail: $43.95 | Customer: $38.95
+  Lower Cortisol. Clear Brain Fog. Helps with: high cortisol, brain fog, anxiety, stress, poor memory, mental clarity
+- Stress B Complex™ | Retail: $40.95 | Customer: $35.95
+  The B Vitamins Your Stressed Body Is Burning Through. Helps with: stress, fatigue, B vitamin deficiency, low energy, mood issues
 
 WOMEN'S HEALTH / HORMONE:
-- LaiDex™ ($36.95): End Hot Flashes. Balance Hormones. Feel Like Yourself Again. Helps with: hot flashes, night sweats, menopause, perimenopause, hormone imbalance, sleep disruption
-- Hormony Pro™ ($59.95): Bioidentical Progesterone. Real Hormone Balance. Helps with: PMS, bloating, mood swings, cramps, low progesterone, estrogen dominance, perimenopause
-- Thyroid Support™ ($35.95): Support Your Thyroid. Restore Your Metabolism. Helps with: hypothyroid, slow metabolism, weight gain, hair loss, cold intolerance, fatigue, brain fog, constipation
+- LaiDex™ | Retail: $34.95 | Customer: $29.95
+  End Hot Flashes. Balance Hormones. Helps with: hot flashes, night sweats, menopause, perimenopause, hormone imbalance, sleep disruption
+- Hormony Pro™ | Retail: $59.95 | Customer: $54.95
+  Bioidentical Progesterone. Real Hormone Balance. Helps with: PMS, bloating, mood swings, cramps, low progesterone, estrogen dominance, perimenopause
+- Thyroid Support™ | Retail: $39.95 | Customer: $34.95
+  Support Your Thyroid. Restore Your Metabolism. Helps with: hypothyroid, slow metabolism, weight gain, hair loss, cold intolerance, fatigue, brain fog
 
 BRAIN & COGNITIVE:
-- CogHealth™ ($34.95): Advanced Cognitive Support for Memory, Focus, and Brain Longevity. Helps with: brain fog, memory loss, poor focus, cognitive decline, ADHD, mental fatigue
-- Sertona™ ($36.95): Natural Serotonin Support for Mood, Calm, and Emotional Balance. Helps with: low mood, depression, anxiety, emotional imbalance, serotonin deficiency, mood swings
+- CogHealth™ | Retail: $39.95 | Customer: $34.95
+  Advanced Cognitive Support. Helps with: brain fog, memory loss, poor focus, cognitive decline, ADHD, mental fatigue
+- Sertona™ | Retail: $39.95 | Customer: $34.95
+  Natural Serotonin Support. Helps with: low mood, depression, anxiety, emotional imbalance, serotonin deficiency, mood swings
 
 SLEEP:
-- SleepEasy™ ($34.95): Deep, Restorative Sleep — Without Dependency or Grogginess. Helps with: insomnia, poor sleep, trouble falling asleep, waking at night, sleep anxiety, racing mind
+- SleepEasy™ | Retail: $39.95 | Customer: $34.95
+  Deep, Restorative Sleep. Helps with: insomnia, poor sleep, trouble falling asleep, waking at night, sleep anxiety, racing mind
 
 GUT & DIGESTIVE HEALTH:
-- Flora Repair™ ($36.95): 30 Billion CFU. Real Gut Balance. Real Results. Helps with: gut imbalance, bloating, digestive issues, immune weakness, IBS, after antibiotics, leaky gut
-- GreenMed Rx™ ($38.95): Alkalize. Detoxify. Energize. In One Daily Scoop. Helps with: toxin buildup, poor gut health, inflammation, low energy, liver stress, weight gain, detox
-- Paradix™ ($37.95): Heal Your Gut Lining. End Digestive Suffering. Helps with: leaky gut, IBS, intestinal permeability, food sensitivities, autoimmune gut conditions, bloating, cramping
-- Enzyme Restore™ ($35.95): Digest Your Food. Absorb Your Nutrients. End the Bloat. Helps with: bloating after meals, gas, indigestion, poor nutrient absorption, food sensitivities, GERD
+- Flora Repair 30 Billion™ | Retail: $41.95 | Customer: $36.95
+  30 Billion CFU. Real Gut Balance. Helps with: gut imbalance, bloating, digestive issues, immune weakness, IBS, after antibiotics, leaky gut
+- GreenMed Super Greens™ | Retail: $41.95 | Customer: $36.95
+  Alkalize. Detoxify. Energize. Helps with: toxin buildup, poor gut health, inflammation, low energy, liver stress, detox
+- Paradix™ | Retail: $42.95 | Customer: $37.95
+  Heal Your Gut Lining. Helps with: leaky gut, IBS, intestinal permeability, food sensitivities, autoimmune gut conditions, bloating
+- Enzyme Restore™ | Retail: $40.95 | Customer: $35.95
+  Digest Your Food. Absorb Your Nutrients. Helps with: bloating after meals, gas, indigestion, poor nutrient absorption, GERD
 
 HEART & CARDIOVASCULAR:
-- Mega EPA/DHA 3400™ ($26.95): The Omega-3 Dose That Actually Makes a Difference. Helps with: high triglycerides, heart disease risk, inflammation, joint pain, brain fog, dry skin, cardiovascular health
+- Mega EPA/DHA 3400™ | Retail: $31.95 | Customer: $26.95
+  The Omega-3 Dose That Actually Makes a Difference. Helps with: high triglycerides, heart disease risk, inflammation, joint pain, brain fog, cardiovascular health
 
 WEIGHT MANAGEMENT / METABOLISM:
-- Amino Restore Vanilla™ ($51.95): Physician-Formulated Protein for Muscle, Metabolism, and Recovery. Helps with: muscle loss, slow recovery, low muscle mass, post-workout soreness, body composition, weight loss
-- Amino Restore Chocolate™ ($51.95): Physician-Formulated Chocolate Protein for Muscle, Metabolism, and Hormones. Same benefits as Vanilla — chocolate flavor option.
-- MIC•B Rx™ ($38.95): Physician-Formulated Blood Sugar and Glucose Metabolism Support. Helps with: blood sugar spikes, insulin resistance, pre-diabetes, weight gain, metabolic syndrome
-- MCT Oil Rx™ ($27.95): Clean Brain Fuel. Instant Energy. Fat Burning Support. Helps with: brain fog, low energy, weight management, ketone production, mental clarity, fat burning
+- Amino Restore Vanilla™ | Retail: $51.95 | Customer: $46.95
+  Physician-Formulated Protein for Muscle, Metabolism, and Recovery. Helps with: muscle loss, slow recovery, body composition, weight loss
+- Amino Restore Chocolate™ | Retail: $51.95 | Customer: $46.95
+  Same formula as Vanilla — chocolate flavor option.
+- MIC•B Rx™ | Retail: $43.95 | Customer: $38.95
+  Blood Sugar and Glucose Metabolism Support. Helps with: blood sugar spikes, insulin resistance, pre-diabetes, weight gain, metabolic syndrome
+- MCT Oil Rx™ | Retail: $32.95 | Customer: $27.95
+  Clean Brain Fuel. Instant Energy. Fat Burning Support. Helps with: brain fog, low energy, weight management, ketone production, fat burning
 
 HAIR HEALTH:
-- Genesis™ Hair Oil ($36.95): Physician-Formulated Topical Support for Thinning Hair and Hair Loss. Helps with: hair thinning, hair loss, DHT-related hair loss, follicle stimulation
+- Genesis™ Hair Oil | Retail: $41.95 | Customer: $36.95
+  Physician-Formulated Topical Support for Thinning Hair. Helps with: hair thinning, hair loss, DHT-related hair loss, follicle stimulation
 
 VITAMINS & MINERALS:
-- Vitamin D3 10,000 IU™ ($26.95): The Vitamin Deficiency That Affects Everything — Finally Fixed. Helps with: vitamin D deficiency, bone loss, immune weakness, depression, fatigue, muscle weakness
-- MaxHealth Multivitamin™ ($34.95): The Multivitamin That Actually Gets Absorbed. Helps with: nutritional gaps, general wellness, fatigue, immune support, daily foundation
-- BioFlav C 2000™ ($36.95): High-Potency Vitamin C with Bioflavonoids for Maximum Absorption. Helps with: frequent illness, weak immune system, slow wound healing, oxidative stress, collagen loss
+- Vitamin D3 10,000 IU™ | Retail: $29.95 | Customer: $24.95
+  The Vitamin Deficiency That Affects Everything. Helps with: vitamin D deficiency, bone loss, immune weakness, depression, fatigue
+- MaxHealth Multivitamin™ | Retail: $39.95 | Customer: $34.95
+  The Multivitamin That Actually Gets Absorbed. Helps with: nutritional gaps, general wellness, fatigue, immune support
+- BioFlav C 2000™ | Retail: $41.95 | Customer: $36.95
+  High-Potency Vitamin C with Bioflavonoids. Helps with: frequent illness, weak immune system, slow wound healing, oxidative stress
 
 PAIN RELIEF:
-- Hemp Extract Cream™ ($69.95): Physician-Formulated Topical Relief for Muscles, Joints & Inflammation. Helps with: muscle pain, joint pain, inflammation, arthritis, topical pain relief
+- Hemp Extract Cream™ | Retail: $74.95 | Customer: $69.95
+  Physician-Formulated Topical Relief for Muscles, Joints & Inflammation. Helps with: muscle pain, joint pain, inflammation, arthritis
 
 DR. TAYLOR'S BOOKS:
-- "Are Your Hormones Making You Sick?" by Dr. Ava Bell-Taylor, M.D. ($15.00): A woman's guide to better health through hormonal balance. Covers estrogen dominance, progesterone deficiency, hormonal weight gain, mood swings, fatigue, hot flashes, menopause, PCOS.
-- "The Stress Connection" by Dr. Ava Bell-Taylor, M.D. ($15.00): 2nd edition. Explains how chronic stress, adrenal dysfunction, and cortisol imbalance drive a wide range of symptoms — and how to restore balance.
+- "Are Your Hormones Making You Sick?" by Dr. Ava Bell-Taylor, M.D. — $15.00
+  A woman's guide to hormone balance. Covers estrogen dominance, progesterone deficiency, hot flashes, menopause, PCOS, mood swings, fatigue.
+- "The Stress Connection" by Dr. Ava Bell-Taylor, M.D. — $15.00
+  2nd edition. How chronic stress, adrenal dysfunction, and cortisol imbalance drive symptoms — and how to restore balance.
+
+LOYALTY / SAVINGS PROGRAM (tell callers about this!):
+- Create a free account at taylormdformulations.com to unlock:
+  * Free shipping at $50 (guests pay $75 minimum for free shipping)
+  * 10% off your second order automatically
+  * $5 off per product on orders of $50 or more
+  * 15% off when you buy any 3 or more products
+  * $5 off per product plus free shipping on every autoship/subscription order
+  * Leave a product review and get $5 off your next order
+  * Refer a friend — you both get $10 off when they place their first order
 
 SHIPPING POLICY:
-- Free shipping on orders over $75
+- Free shipping on orders over $75 (guests) or $50 (registered customers)
 - Ships within 2-3 business days
 - Order number format: TMD-XXXXXXXXXX
 
 RETURNS POLICY:
 - 30-day satisfaction guarantee
 - Contact us at taylormdformulations.com/contact for returns
-- We do not accept returns by phone — all return requests must go through the website
+- Returns cannot be processed by phone
 
 ALL PRODUCTS:
 - Physician-formulated by Dr. Ava Bell-Taylor, M.D. and Dr. Eldred B. Taylor, M.D.
@@ -272,52 +338,58 @@ ALL PRODUCTS:
 - Available at taylormdformulations.com
 `;
 
-// ─── AI RESPONSE ENGINE ───────────────────────────────────────────────────────
+// ─── AI SYSTEM PROMPT ─────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Patrice, the AI phone receptionist for Taylor MD Formulations — a physician-formulated supplement company founded by Dr. Ava Bell-Taylor, M.D. and Dr. Eldred B. Taylor, M.D.
 
-You are speaking to callers over the phone. Keep responses SHORT and conversational — 1-3 sentences maximum. This is a phone call, not a chat.
+You are speaking to callers over the phone. Keep responses SHORT and conversational — 1 to 3 sentences maximum. This is a phone call, not a chat.
 
 YOUR CAPABILITIES:
 1. Answer questions about any Taylor MD Formulations product
 2. Help callers find the right supplement based on their symptoms
 3. Provide order status (ask for email or order number starting with TMD-)
-4. Share shipping and returns policy
-5. Provide information about Dr. Taylor's books
+4. Share pricing tiers — retail, registered customer ($5 off on $50+ orders), practitioner
+5. Explain the loyalty and savings program
+6. Share shipping and returns policy
+7. Provide information about Dr. Taylor's books
 
 STRICT RULES — NEVER BREAK THESE:
 - NEVER transfer a call or offer to connect to a human
-- NEVER share a physical address or give directions
-- NEVER give out the office phone number (678-443-4099) — this is a retail supplement company, not a medical practice
-- If caller wants to speak to a human: direct them to taylormdformulations.com/contact or email info@taylormdformulations.com
-- If caller is a sales rep or vendor: say "For business inquiries, please email info@taylormdformulations.com" then end the call politely
+- NEVER share a physical address or give directions — this is an online-only supplement company
+- NEVER give out the business phone number
+- If caller wants to speak to a human: say "You can email our team at info at taylormdformulations.com and someone will follow up with you within 48 hours"
+- If caller is a sales rep or vendor: say "For business inquiries, please email info at taylormdformulations.com" then end the call politely
 - NEVER diagnose medical conditions — always frame as "supporting" or "helping with" symptoms
-- If asked about medical advice, say "I'm not able to give medical advice, but I can tell you which of our physician-formulated products may support those symptoms"
+- If asked for medical advice: say "I'm not able to give medical advice, but I can tell you which of our physician-formulated products may support those symptoms"
+- If you cannot answer a question: say "I want to make sure you get the right answer — please email us at info at taylormdformulations.com and our team will follow up within 48 hours"
+- NEVER leave a caller without a next step — always give the email address or website
+
+DEAD-END RULE: If you cannot resolve a request, ALWAYS say:
+"I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours."
 
 LANGUAGE RULE: Detect the caller's language and respond in that same language. Product names stay in English.
+
+TONE: Warm, professional, confident. You represent a physician-led brand. Never sound scripted or robotic.
 
 PRODUCT KNOWLEDGE:
 ${PRODUCT_CATALOG}`;
 
+// ─── AI RESPONSE ENGINE ───────────────────────────────────────────────────────
 async function getAIResponse(callSid, callerSpeech, orderContext = null) {
   const sess = getSession(callSid);
-  const openaiKey = process.env.OPENAI_API_KEY;
+  const openaiKey = CONFIG.openai.apiKey;
   if (!openaiKey) {
-    return "I'm sorry, I'm having a technical issue right now. Please visit taylormdformulations.com or email info@taylormdformulations.com for assistance.";
+    return deadEndMessage();
   }
 
-  // Add caller speech to history
   sess.conversationHistory.push({ role: 'user', content: callerSpeech });
   sess.callLog.push(`Caller: ${callerSpeech.slice(0, 200)}`);
 
-  // Build messages
   let systemContent = SYSTEM_PROMPT;
-  if (orderContext) {
-    systemContent += `\n\nORDER LOOKUP RESULT:\n${orderContext}`;
-  }
+  if (orderContext) systemContent += `\n\nORDER LOOKUP RESULT:\n${orderContext}`;
 
   const messages = [
     { role: 'system', content: systemContent },
-    ...sess.conversationHistory.slice(-10), // keep last 10 turns for context
+    ...sess.conversationHistory.slice(-10),
   ];
 
   try {
@@ -336,49 +408,46 @@ async function getAIResponse(callSid, callerSpeech, orderContext = null) {
       sess.conversationHistory.push({ role: 'assistant', content: reply });
       sess.callLog.push(`Patrice: ${reply.slice(0, 200)}`);
     }
-    return reply || "I'm sorry, could you repeat that?";
+    return reply || deadEndMessage();
   } catch (err) {
     console.error('[AI] OpenAI error:', err.response?.data || err.message);
-    return "I'm having a brief technical issue. Please visit taylormdformulations.com or email info@taylormdformulations.com for help.";
+    return deadEndMessage();
   }
 }
 
-// ─── INTENT DETECTION (keyword-based, fast) ───────────────────────────────────
+// ─── INTENT DETECTION ─────────────────────────────────────────────────────────
 function detectIntent(speech) {
   const s = (speech || '').toLowerCase();
   if (/order|track|ship|deliver|package|status|where.*order|my order/.test(s)) return 'order';
   if (/return|refund|exchange|money back/.test(s)) return 'return';
-  if (/price|cost|how much|shipping cost|free ship/.test(s)) return 'pricing';
-  if (/sales|vendor|partner|wholesale|distributor|business/.test(s)) return 'sales';
-  if (/human|person|agent|representative|speak to|talk to|real person|transfer/.test(s)) return 'human';
-  if (/address|location|office|store|directions|where are you|visit/.test(s)) return 'address';
-  if (/book|dr\. taylor|doctor taylor|stress connection|hormones making you sick/.test(s)) return 'book';
-  if (/bye|goodbye|hang up|that.s all|no thank|nothing else|i.m good/.test(s)) return 'goodbye';
-  return 'product'; // default — product/health question
+  if (/price|cost|how much|shipping cost|free ship|discount|save|loyalty|reward|account|register|member/.test(s)) return 'pricing';
+  if (/practitioner|wholesale|distributor|bulk|clinic|doctor.*order|provider/.test(s)) return 'practitioner';
+  if (/sales|vendor|partner|business inquiry|selling|represent/.test(s)) return 'sales';
+  if (/human|person|agent|representative|speak to|talk to|real person|transfer|staff|team/.test(s)) return 'human';
+  if (/address|location|office|store|directions|where are you|visit|in person|pick up/.test(s)) return 'address';
+  if (/book|are your hormones|stress connection|dr\. taylor|doctor taylor/.test(s)) return 'book';
+  if (/review|leave a review|write a review|feedback/.test(s)) return 'review';
+  if (/bye|goodbye|hang up|that.s all|no thank|nothing else|i.m good|all set/.test(s)) return 'goodbye';
+  return 'product';
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
-
-// Health check
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  service: 'Patrice — Taylor MD Formulations AI Receptionist v1.0',
+  service: 'Patrice — Taylor MD Formulations AI Receptionist v2.0',
   phone: CONFIG.twilio.phoneNumber,
 }));
-
 app.get('/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
 
-// Twilio status callback
+// ── Twilio status callback ────────────────────────────────────────────────────
 app.post('/status', async (req, res) => {
   const { CallSid: callSid, CallStatus: status, From: callerPhone } = req.body;
   console.log(`[STATUS] ${callSid}: ${status}`);
-
-  // Send post-call summary when call ends
   if (['completed', 'no-answer', 'busy', 'failed'].includes(status) && callSid) {
     const sess = sessions[callSid];
     if (sess && sess.callLog && sess.callLog.length > 0) {
       const summary = sess.callLog.join('\n');
-      sendCallSummary(callerPhone || 'Unknown', summary, callSid).catch(() => {});
+      sendCallSummary(callerPhone || 'Unknown', summary).catch(() => {});
       clearSession(callSid);
     }
   }
@@ -387,43 +456,56 @@ app.post('/status', async (req, res) => {
 
 // ── INCOMING CALL GREETING ────────────────────────────────────────────────────
 app.post('/voice', (req, res) => {
-  const twiml = new VoiceResponse();
-  const callSid = req.body.CallSid;
+  const twiml       = new VoiceResponse();
+  const callSid     = req.body.CallSid;
   const callerPhone = req.body.From || 'anonymous';
-
-  const sess = getSession(callSid);
-  sess.callerPhone = callerPhone;
-  sess._startTime = Date.now();
-  sess.callLog = [];
+  const sess        = getSession(callSid);
+  sess.callerPhone  = callerPhone;
+  sess.callLog      = [];
   sess.conversationHistory = [];
-
+  sess.noInputCount = 0;
   console.log(`[CALL] Incoming from ${callerPhone} | SID: ${callSid}`);
-
-  const greeting = "Thank you for calling Taylor MD Formulations! This is Patrice, your virtual assistant. I can help you with product questions, order status, or anything about our physician-formulated supplements. How can I help you today?";
+  const greeting = "Thank you for calling Taylor MD Formulations! This is Patrice, your virtual assistant. I can help you with product questions, order status, pricing and savings, or anything about our physician-formulated supplements. How can I help you today?";
   const g = gather(twiml, '/respond', { timeout: 10, speechTimeout: '2' });
   say(g, greeting, callSid);
   twiml.redirect('/no-input');
-
   res.type('text/xml').send(twiml.toString());
 });
 
 // ── NO INPUT HANDLER ──────────────────────────────────────────────────────────
 app.post('/no-input', (req, res) => {
-  const twiml = new VoiceResponse();
+  const twiml   = new VoiceResponse();
   const callSid = req.body.CallSid;
+  const sess    = getSession(callSid);
+  sess.noInputCount = (sess.noInputCount || 0) + 1;
+
+  if (sess.noInputCount >= 3) {
+    // Three strikes — give email and hang up gracefully
+    say(twiml,
+      "I haven't been able to hear you — that's okay! You can reach us anytime by emailing info at taylormdformulations.com, " +
+      "or visit taylormdformulations.com. Our team will be happy to help. Thank you for calling, and have a wonderful day!",
+      callSid
+    );
+    twiml.hangup();
+    sendCallSummary(sess.callerPhone || 'Unknown', (sess.callLog || []).join('\n') + '\n[Call ended: no input after 3 attempts]').catch(() => {});
+    clearSession(callSid);
+    return res.type('text/xml').send(twiml.toString());
+  }
+
   const g = gather(twiml, '/respond', { timeout: 10 });
-  say(g, "I'm here to help! You can ask me about our products, check an order status, or ask about shipping. What can I do for you?", callSid);
-  twiml.hangup();
+  say(g, "I'm here to help! You can ask me about our products, check an order, or ask about pricing and savings. What can I do for you?", callSid);
+  twiml.redirect('/no-input');
   res.type('text/xml').send(twiml.toString());
 });
 
 // ── MAIN RESPONSE HANDLER ─────────────────────────────────────────────────────
 app.post('/respond', async (req, res) => {
-  const twiml = new VoiceResponse();
-  const callSid  = req.body.CallSid;
+  const twiml       = new VoiceResponse();
+  const callSid     = req.body.CallSid;
   const callerPhone = req.body.From || 'anonymous';
-  const speech   = (req.body.SpeechResult || '').trim();
-  const sess     = getSession(callSid);
+  const speech      = (req.body.SpeechResult || '').trim();
+  const sess        = getSession(callSid);
+  sess.noInputCount = 0; // reset on any speech
 
   if (!speech) {
     const g = gather(twiml, '/respond', { timeout: 10 });
@@ -435,44 +517,117 @@ app.post('/respond', async (req, res) => {
   const intent = detectIntent(speech);
   console.log(`[RESPOND] ${callSid} | Intent: ${intent} | Speech: "${speech.slice(0, 80)}"`);
 
-  // ── SALES CALL ──────────────────────────────────────────────────────────────
+  // ── SALES CALL ────────────────────────────────────────────────────────────
   if (intent === 'sales') {
-    say(twiml, "For business inquiries, please email us at info at taylormdformulations.com. Thank you for calling!", callSid);
-    sess.callLog.push(`[Intent: sales call — redirected to email]`);
+    say(twiml, "For business inquiries, please email us at info at taylormdformulations.com. Our team will review your inquiry and follow up within 48 hours. Thank you for calling!", callSid);
+    sess.callLog.push('[Intent: sales call — redirected to email]');
     twiml.hangup();
     sendCallSummary(callerPhone, sess.callLog.join('\n')).catch(() => {});
     clearSession(callSid);
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // ── WANTS HUMAN ────────────────────────────────────────────────────────────
+  // ── PRACTITIONER / WHOLESALE ──────────────────────────────────────────────
+  if (intent === 'practitioner') {
+    say(twiml,
+      "For practitioner and wholesale pricing, please email us at info at taylormdformulations.com. " +
+      "Include your name, practice, and the products you're interested in, and our team will follow up within 48 hours. " +
+      "Is there anything else I can help you with?",
+      callSid
+    );
+    sess.callLog.push('[Intent: practitioner/wholesale inquiry — directed to email]');
+    const g = gather(twiml, '/respond', { timeout: 8 });
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // ── WANTS HUMAN ──────────────────────────────────────────────────────────
   if (intent === 'human') {
-    say(twiml, "I understand you'd like to speak with someone. You can reach our team at taylormdformulations.com/contact, or email us at info at taylormdformulations.com. Our team typically responds within one business day. Is there anything else I can help you with?", callSid);
+    say(twiml,
+      "I completely understand. You can reach our team directly by emailing info at taylormdformulations.com — " +
+      "that's info at taylor M D formulations dot com — and someone will follow up with you within 48 hours. " +
+      "Is there anything else I can help you with today?",
+      callSid
+    );
     const g = gather(twiml, '/respond', { timeout: 8 });
-    say(g, "", callSid);
-    twiml.hangup();
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // ── ADDRESS / DIRECTIONS ────────────────────────────────────────────────────
+  // ── ADDRESS / DIRECTIONS ──────────────────────────────────────────────────
   if (intent === 'address') {
-    say(twiml, "Taylor MD Formulations is an online supplement company — we don't have a retail location to visit. You can shop and place orders at taylormdformulations.com, or email us at info at taylormdformulations.com. Is there anything else I can help you with?", callSid);
+    say(twiml,
+      "Taylor MD Formulations is an online supplement company — we don't have a retail location. " +
+      "You can shop and place orders at taylormdformulations.com, or email us at info at taylormdformulations.com. " +
+      "Is there anything else I can help you with?",
+      callSid
+    );
     const g = gather(twiml, '/respond', { timeout: 8 });
-    say(g, "", callSid);
-    twiml.hangup();
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // ── RETURNS ─────────────────────────────────────────────────────────────────
+  // ── RETURNS ───────────────────────────────────────────────────────────────
   if (intent === 'return') {
-    say(twiml, "We have a 30-day satisfaction guarantee. To start a return or request a refund, please visit taylormdformulations.com/contact and our team will take care of you. Is there anything else I can help you with?", callSid);
+    say(twiml,
+      "We have a 30-day satisfaction guarantee. To start a return or request a refund, please visit taylormdformulations.com slash contact " +
+      "and our team will take care of you. Is there anything else I can help you with?",
+      callSid
+    );
     const g = gather(twiml, '/respond', { timeout: 8 });
-    say(g, "", callSid);
-    twiml.hangup();
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // ── GOODBYE ─────────────────────────────────────────────────────────────────
+  // ── PRICING / LOYALTY ─────────────────────────────────────────────────────
+  if (intent === 'pricing') {
+    say(twiml,
+      "Great question! All our products are available at taylormdformulations.com. " +
+      "If you create a free account, registered customers save $5 per product on orders of $50 or more, " +
+      "get free shipping at $50 instead of $75, and get 10% off their second order automatically. " +
+      "There are also bundle discounts and autoship savings. Would you like to know the price of a specific product?",
+      callSid
+    );
+    const g = gather(twiml, '/respond', { timeout: 10 });
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // ── REVIEWS ───────────────────────────────────────────────────────────────
+  if (intent === 'review') {
+    say(twiml,
+      "We'd love that! You can leave a review on our website at taylormdformulations.com — " +
+      "and as a thank you, you'll receive $5 off your next order. " +
+      "Your review helps other customers find the right supplement. Is there anything else I can help you with?",
+      callSid
+    );
+    const g = gather(twiml, '/respond', { timeout: 8 });
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // ── BOOKS ─────────────────────────────────────────────────────────────────
+  if (intent === 'book') {
+    say(twiml,
+      "Dr. Ava Bell-Taylor has written two books available at taylormdformulations.com. " +
+      "\"Are Your Hormones Making You Sick?\" covers hormone balance, estrogen dominance, menopause, and PCOS. " +
+      "\"The Stress Connection\" explains how chronic stress and cortisol imbalance drive symptoms. Both are $15. " +
+      "Is there anything else I can help you with?",
+      callSid
+    );
+    const g = gather(twiml, '/respond', { timeout: 8 });
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // ── GOODBYE ───────────────────────────────────────────────────────────────
   if (intent === 'goodbye') {
     say(twiml, "Thank you for calling Taylor MD Formulations! Have a wonderful day!", callSid);
     twiml.hangup();
@@ -481,14 +636,12 @@ app.post('/respond', async (req, res) => {
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // ── ORDER LOOKUP ─────────────────────────────────────────────────────────────
+  // ── ORDER LOOKUP ──────────────────────────────────────────────────────────
   if (intent === 'order') {
-    // Check if we already have an email or order number in session
     const emailMatch = speech.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/);
-    const orderMatch = speech.match(/TMD[-\s]?[A-Z0-9]{8,}/i);
+    const orderMatch = speech.match(/TMD[-\s]?[A-Z0-9]{6,}/i);
 
     if (emailMatch || orderMatch) {
-      // Try to look up the order
       let orderData = null;
       if (orderMatch) {
         const orderNum = orderMatch[0].replace(/\s/g, '').toUpperCase();
@@ -497,47 +650,60 @@ app.post('/respond', async (req, res) => {
         orderData = await lookupOrderByEmail(emailMatch[0]);
       }
 
-      let orderContext = null;
       if (orderData && orderData.length > 0) {
-        orderContext = orderData.map(o =>
+        const orderContext = orderData.map(o =>
           `Order ${o.orderNumber}: Status = ${o.status}, Date = ${o.date}${o.trackingNumber ? ', Tracking = ' + o.trackingNumber : ''}`
         ).join('\n');
         sess.callLog.push(`[Order lookup: found ${orderData.length} order(s)]`);
+        const aiReply = await getAIResponse(callSid, speech, orderContext);
+        const g = gather(twiml, '/respond', { timeout: 10 });
+        say(g, aiReply, callSid);
+        twiml.redirect('/no-input');
       } else {
-        orderContext = 'No orders found for the provided information.';
-        sess.callLog.push(`[Order lookup: no results]`);
+        // Order not found — dead end with email
+        sess.callLog.push('[Order lookup: no results found]');
+        say(twiml,
+          "I wasn't able to find an order with that information. Please email us at info at taylormdformulations.com " +
+          "with your order details and our team will follow up within 48 hours. Is there anything else I can help you with?",
+          callSid
+        );
+        const g = gather(twiml, '/respond', { timeout: 8 });
+        say(g, '', callSid);
+        twiml.redirect('/no-input');
       }
-
-      const aiReply = await getAIResponse(callSid, speech, orderContext);
-      const g = gather(twiml, '/respond', { timeout: 10 });
-      say(g, aiReply, callSid);
-      twiml.redirect('/no-input');
       return res.type('text/xml').send(twiml.toString());
     } else {
       // Ask for email or order number
       say(twiml, "I can look up your order! Could you please provide your email address or your order number? Order numbers start with T-M-D.", callSid);
       const g = gather(twiml, '/order-lookup', { timeout: 15, speechTimeout: '3' });
-      say(g, "", callSid);
+      say(g, '', callSid);
       twiml.redirect('/no-input');
       return res.type('text/xml').send(twiml.toString());
     }
   }
 
-  // ── PRODUCT / HEALTH / BOOK / PRICING — AI RESPONSE ──────────────────────
-  const aiReply = await getAIResponse(callSid, speech);
-  const g = gather(twiml, '/respond', { timeout: 10 });
-  say(g, aiReply, callSid);
-  twiml.redirect('/no-input');
+  // ── PRODUCT / HEALTH / DEFAULT — AI RESPONSE ─────────────────────────────
+  try {
+    const aiReply = await getAIResponse(callSid, speech);
+    const g = gather(twiml, '/respond', { timeout: 10 });
+    say(g, aiReply, callSid);
+    twiml.redirect('/no-input');
+  } catch (err) {
+    console.error('[RESPOND] AI error:', err.message);
+    say(twiml, deadEndMessage(), callSid);
+    const g = gather(twiml, '/respond', { timeout: 8 });
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
+  }
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── ORDER LOOKUP (collect email/order number) ─────────────────────────────────
+// ── ORDER LOOKUP — collect email or order number ──────────────────────────────
 app.post('/order-lookup', async (req, res) => {
-  const twiml = new VoiceResponse();
+  const twiml   = new VoiceResponse();
   const callSid = req.body.CallSid;
-  const callerPhone = req.body.From || 'anonymous';
-  const speech = (req.body.SpeechResult || '').trim();
-  const sess = getSession(callSid);
+  const speech  = (req.body.SpeechResult || '').trim();
+  const sess    = getSession(callSid);
 
   if (!speech) {
     const g = gather(twiml, '/order-lookup', { timeout: 12 });
@@ -547,8 +713,7 @@ app.post('/order-lookup', async (req, res) => {
   }
 
   const emailMatch = speech.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/);
-  const orderMatch = speech.match(/TMD[-\s]?[A-Z0-9]{8,}/i);
-
+  const orderMatch = speech.match(/TMD[-\s]?[A-Z0-9]{6,}/i);
   let orderData = null;
   let lookupKey = '';
 
@@ -559,33 +724,40 @@ app.post('/order-lookup', async (req, res) => {
     lookupKey = emailMatch[0];
     orderData = await lookupOrderByEmail(lookupKey);
   } else {
-    // Couldn't parse — try AI to help
-    const aiReply = await getAIResponse(callSid, `The caller said: "${speech}" when asked for their email or order number. Help them.`);
-    const g = gather(twiml, '/order-lookup', { timeout: 12 });
-    say(g, aiReply, callSid);
+    // Cannot parse — dead end with email
+    sess.callLog.push(`[Order lookup: could not parse input "${speech.slice(0, 80)}"]`);
+    say(twiml, deadEndMessage(), callSid);
+    const g = gather(twiml, '/respond', { timeout: 8 });
+    say(g, '', callSid);
     twiml.redirect('/no-input');
     return res.type('text/xml').send(twiml.toString());
   }
 
-  let orderContext = '';
   if (orderData && orderData.length > 0) {
-    orderContext = orderData.map(o =>
+    const orderContext = orderData.map(o =>
       `Order ${o.orderNumber}: Status = ${o.status}, Date = ${o.date}${o.trackingNumber ? ', Tracking number = ' + o.trackingNumber : ''}`
     ).join('\n');
     sess.callLog.push(`[Order lookup for ${lookupKey}: found ${orderData.length} order(s)]`);
+    const aiReply = await getAIResponse(callSid, `Order lookup result for ${lookupKey}`, orderContext);
+    const g = gather(twiml, '/respond', { timeout: 10 });
+    say(g, aiReply, callSid);
+    twiml.redirect('/no-input');
   } else {
-    orderContext = `No orders found for: ${lookupKey}`;
+    // Not found — dead end with email
     sess.callLog.push(`[Order lookup for ${lookupKey}: not found]`);
+    say(twiml,
+      `I wasn't able to find an order for that information. Please email us at info at taylormdformulations.com ` +
+      "with your order details and our team will follow up within 48 hours. Is there anything else I can help you with?",
+      callSid
+    );
+    const g = gather(twiml, '/respond', { timeout: 8 });
+    say(g, '', callSid);
+    twiml.redirect('/no-input');
   }
-
-  const aiReply = await getAIResponse(callSid, `Order lookup result for ${lookupKey}`, orderContext);
-  const g = gather(twiml, '/respond', { timeout: 10 });
-  say(g, aiReply, callSid);
-  twiml.redirect('/no-input');
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── CALL LOGS ─────────────────────────────────────────────────────────────────
+// ── CALL LOGS (admin) ─────────────────────────────────────────────────────────
 app.get('/call-logs', async (req, res) => {
   try {
     const client = getTwilioClient();
@@ -607,9 +779,17 @@ app.get('/call-logs', async (req, res) => {
   }
 });
 
+// ─── GLOBAL ERROR GUARD ───────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err.message);
+});
+
 // ─── START SERVER ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Patrice — Taylor MD Formulations AI Receptionist v1.0 running on port ${PORT}`);
+  console.log(`Patrice — Taylor MD Formulations AI Receptionist v2.0 running on port ${PORT}`);
 });
 
 module.exports = app;
