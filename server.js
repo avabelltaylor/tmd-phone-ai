@@ -1,25 +1,32 @@
 'use strict';
 /**
- * Patrice — AI Phone Receptionist for Taylor MD Formulations v2.0
+ * Patrice — AI Phone Receptionist for Taylor MD Formulations v3.0
  * Twilio: +1 (706) 408-9670  |  Business: 678-443-4099
  * Voice only — SMS handled via RingCentral
  *
- * v2.0 changes:
- *  - Zero dead ends: every unresolved path gives info@taylormdformulations.com + 48h follow-up
+ * v3.0 — Full Taylor-level safeguards applied:
+ *  - /health endpoint + self-ping watchdog (every 4 min)
+ *  - Startup confirmation email to all staff
+ *  - Downtime alert after 3 consecutive failed pings
+ *  - Recovery alert when service comes back online
+ *  - Danielle-Neural voice at 85% speech rate with SSML pauses
+ *  - "Virtual assistant" language removed — just "this is Patrice"
+ *  - Universal escape detection (checkEscape) — fires on frustration signals
+ *  - buildEscalationResponse — collects caller name/phone/email before offering options
+ *  - Frustration counters on all confirmation loops
+ *  - Post-call email via /clinic/status with 12-second recording delay
+ *  - Persistent transcript storage to /data/transcripts.jsonl
+ *  - Correct staff email list (5 recipients)
  *  - 3-tier pricing: Retail / Registered Customer ($5 off on $50+) / Practitioner
- *  - Loyalty program talking points
- *  - No-input counter (3 strikes → graceful goodbye with email)
- *  - Human request → email + 48h (not just website link)
- *  - All gather() calls followed by redirect (no more hangup after gather)
- *  - Post-call summary email to staff
- *  - Practitioner / wholesale intent detection
- *  - Review reward talking point
+ *  - Loyalty program, order lookup, product AI, no dead ends
  */
 
 require('dotenv').config();
 const express = require('express');
 const twilio  = require('twilio');
 const axios   = require('axios');
+const fs      = require('fs');
+const path    = require('path');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -45,8 +52,14 @@ const CONFIG = {
     apiKey: process.env.OPENAI_API_KEY,
   },
   email: {
-    from:    'Patrice at Taylor MD Formulations <noreply@taylormdformulations.com>',
-    staffTo: ['info@taylormdformulations.com', 'ebtaylormd@gmail.com'],
+    from:    'Patrice at Taylor MD <noreply@taylormdformulations.com>',
+    staffTo: [
+      'avataylormd@gmail.com',
+      'eldred_taylormd@yahoo.com',
+      'info@taylormedicalgroup.net',
+      'taylormedicalgroup2@gmail.com',
+      'winston.taylor9115@gmail.com',
+    ],
   },
   brand: {
     name:        'Taylor MD Formulations',
@@ -54,9 +67,33 @@ const CONFIG = {
     contactPage: 'taylormdformulations.com/contact',
     staffEmail:  'info@taylormdformulations.com',
   },
+  serviceUrl: process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : (process.env.SERVICE_URL || 'https://patrice-production.up.railway.app'),
 };
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
+
+// ─── PERSISTENT TRANSCRIPT STORAGE ───────────────────────────────────────────
+const TRANSCRIPT_DIR  = '/data';
+const TRANSCRIPT_FILE = path.join(TRANSCRIPT_DIR, 'transcripts.jsonl');
+
+function ensureTranscriptDir() {
+  try {
+    if (!fs.existsSync(TRANSCRIPT_DIR)) fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+  } catch (e) {
+    console.warn('[TRANSCRIPT] Cannot create /data dir:', e.message);
+  }
+}
+ensureTranscriptDir();
+
+function saveTranscript(record) {
+  try {
+    fs.appendFileSync(TRANSCRIPT_FILE, JSON.stringify(record) + '\n', 'utf8');
+  } catch (e) {
+    console.warn('[TRANSCRIPT] Write failed:', e.message);
+  }
+}
 
 // ─── SESSION STORE ────────────────────────────────────────────────────────────
 const sessions = {};
@@ -66,7 +103,11 @@ function getSession(callSid) {
       callLog: [],
       conversationHistory: [],
       callerPhone: '',
+      callerName: '',
+      callerEmail: '',
       noInputCount: 0,
+      frustrationCount: 0,
+      escalated: false,
       _startTime: Date.now(),
     };
   }
@@ -85,8 +126,19 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 // ─── TWILIO HELPERS ───────────────────────────────────────────────────────────
+/**
+ * say() — uses Danielle-Neural at 85% speech rate with SSML prosody
+ * Automatically adds 600ms pauses after phone numbers and URLs
+ */
 function say(twiml, text, callSid = null) {
-  twiml.say({ voice: 'Polly.Joanna-Neural', language: 'en-US' }, text);
+  // Inject SSML pauses after phone numbers and URLs
+  let ssml = text
+    .replace(/(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})/g, '$1<break time="600ms"/>')
+    .replace(/([\w-]+\.(?:com|net|org|edu|gov)(?:\/[\w/.-]*)?)/g, '$1<break time="600ms"/>');
+
+  const sayNode = twiml.say({ voice: 'Polly.Danielle-Neural', language: 'en-US' });
+  sayNode.prosody({ rate: '85%' }, ssml);
+
   if (callSid) {
     const sess = getSession(callSid);
     sess.callLog.push(`Patrice: ${text.slice(0, 200)}`);
@@ -115,14 +167,59 @@ function getTwilioClient() {
   return _twilioClient;
 }
 
-// ─── DEAD-END HANDLER ─────────────────────────────────────────────────────────
-// Called whenever Patrice cannot resolve a request
-function deadEndMessage() {
-  return (
-    "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com — " +
-    "that's info at taylor M D formulations dot com — and a member of our team will follow up with you within 48 hours. " +
-    "Is there anything else I can help you with today?"
-  );
+// ─── UNIVERSAL ESCAPE DETECTION ───────────────────────────────────────────────
+/**
+ * Detects frustration signals, repeated "no", staff name requests, or explicit
+ * requests to speak to a human. Returns { triggered: bool, action: 'escalate'|'goodbye' }
+ */
+function checkEscape(speech, sess) {
+  const s = (speech || '').toLowerCase().trim();
+
+  // Explicit goodbye
+  if (/^(bye|goodbye|hang up|that.?s all|no thank|nothing else|i.?m good|all set|never mind|forget it)/.test(s)) {
+    return { triggered: true, action: 'goodbye' };
+  }
+
+  // Staff name requests — escalate immediately
+  if (/\b(ava|dr\.?\s*ava|dr\.?\s*taylor|dr\.?\s*bell|eldred|winston|staff|manager|supervisor|owner)\b/.test(s)) {
+    return { triggered: true, action: 'escalate' };
+  }
+
+  // Human / agent request
+  if (/\b(human|person|agent|representative|speak to|talk to|real person|transfer|someone|anybody|operator)\b/.test(s)) {
+    return { triggered: true, action: 'escalate' };
+  }
+
+  // Frustration signals
+  if (/\b(frustrated|annoyed|ridiculous|useless|terrible|awful|this is stupid|not helpful|waste of time|just help me)\b/.test(s)) {
+    sess.frustrationCount = (sess.frustrationCount || 0) + 1;
+    if (sess.frustrationCount >= 1) return { triggered: true, action: 'escalate' };
+  }
+
+  // Repeated "no" or negative
+  if (/^(no+|nope|nah|not really|not helpful|that.?s not|that doesn.?t)/.test(s)) {
+    sess.frustrationCount = (sess.frustrationCount || 0) + 1;
+    if (sess.frustrationCount >= 2) return { triggered: true, action: 'escalate' };
+  }
+
+  return { triggered: false };
+}
+
+// ─── ESCALATION RESPONSE ──────────────────────────────────────────────────────
+/**
+ * Collects caller name/phone/email before offering message or website options.
+ * Mirrors Taylor's buildEscalationResponse exactly.
+ */
+function buildEscalationResponse(twiml, callSid, reason = '') {
+  const sess = getSession(callSid);
+  sess.escalated = true;
+  if (reason) sess.callLog.push(`[ESCALATION: ${reason}]`);
+
+  const msg = "I want to make sure you get the right help. Let me take down your information so our team can follow up with you. " +
+    "Could you please tell me your name?";
+  const g = gather(twiml, '/escalation-name', { timeout: 12, speechTimeout: '3' });
+  say(g, msg, callSid);
+  twiml.redirect('/no-input');
 }
 
 // ─── EMAIL (RESEND) ───────────────────────────────────────────────────────────
@@ -148,21 +245,31 @@ async function sendEmail(subject, htmlBody, textBody) {
   }
 }
 
-async function sendCallSummary(callerPhone, summary) {
+async function sendCallSummary({ callerPhone, transcript, recordingUrl, duration, callSid }) {
   const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-  const text = `📋 TMD Call Summary — ${now} ET\n📱 Caller: ${callerPhone}\n─────────────────────\n${summary}`;
+  const recLink = recordingUrl
+    ? `<p><strong>🎙 Recording:</strong> <a href="${recordingUrl}">${recordingUrl}</a></p>`
+    : '<p><em>Recording not available</em></p>';
+  const recText = recordingUrl ? `Recording: ${recordingUrl}` : 'Recording: not available';
+
   const html = `
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
-      <h2 style="color:#1a6b4a;border-bottom:2px solid #1a6b4a;padding-bottom:8px;">📋 TMD Call Summary</h2>
+    <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;">
+      <h2 style="color:#1a6b4a;border-bottom:2px solid #1a6b4a;padding-bottom:8px;">📋 TMD Call Summary — Patrice</h2>
       <p><strong>Time:</strong> ${now} ET</p>
       <p><strong>Caller:</strong> ${callerPhone}</p>
+      <p><strong>Duration:</strong> ${duration ? duration + 's' : 'unknown'}</p>
+      <p><strong>Call SID:</strong> ${callSid || 'unknown'}</p>
+      ${recLink}
       <hr style="border:1px solid #e2e8f0;"/>
-      <div style="background:#f7fafc;padding:16px;border-radius:8px;white-space:pre-wrap;font-size:14px;">
-        ${summary.replace(/\n/g, '<br>')}
+      <h3 style="color:#2d3748;">Transcript</h3>
+      <div style="background:#f7fafc;padding:16px;border-radius:8px;white-space:pre-wrap;font-size:14px;line-height:1.6;">
+        ${(transcript || '').replace(/\n/g, '<br>')}
       </div>
-      <p style="color:#718096;font-size:12px;margin-top:16px;">Sent by Patrice — Taylor MD Formulations AI Receptionist v2.0</p>
+      <p style="color:#718096;font-size:12px;margin-top:16px;">Sent by Patrice — Taylor MD Formulations AI Receptionist v3.0</p>
     </div>`;
-  await sendEmail(`TMD Call Summary — ${now} ET | Caller: ${callerPhone}`, html, text).catch(() => {});
+  const text = `TMD Call Summary — ${now} ET\nCaller: ${callerPhone}\nDuration: ${duration || 'unknown'}s\n${recText}\n\n${transcript || ''}`;
+
+  await sendEmail(`TMD Call — ${now} ET | ${callerPhone}`, html, text).catch(() => {});
 }
 
 // ─── SHIPSTATION ORDER LOOKUP ─────────────────────────────────────────────────
@@ -233,7 +340,7 @@ async function lookupOrderByNumber(orderNumber) {
 
 // ─── PRODUCT CATALOG — 3-TIER PRICING ────────────────────────────────────────
 const PRODUCT_CATALOG = `
-TAYLOR MD FORMULATIONS — PRODUCT CATALOG v2.0
+TAYLOR MD FORMULATIONS — PRODUCT CATALOG v3.0
 
 PRICING TIERS:
 - Retail: Standard price for all website visitors at taylormdformulations.com
@@ -312,7 +419,7 @@ DR. TAYLOR'S BOOKS:
 - "The Stress Connection" by Dr. Ava Bell-Taylor, M.D. — $15.00
   2nd edition. How chronic stress, adrenal dysfunction, and cortisol imbalance drive symptoms — and how to restore balance.
 
-LOYALTY / SAVINGS PROGRAM (tell callers about this!):
+LOYALTY / SAVINGS PROGRAM:
 - Create a free account at taylormdformulations.com to unlock:
   * Free shipping at $50 (guests pay $75 minimum for free shipping)
   * 10% off your second order automatically
@@ -325,7 +432,7 @@ LOYALTY / SAVINGS PROGRAM (tell callers about this!):
 SHIPPING POLICY:
 - Free shipping on orders over $75 (guests) or $50 (registered customers)
 - Ships within 2-3 business days
-- Order number format: TMD-XXXXXXXXXX
+- Orders placed before 2 PM ET ship same business day
 
 RETURNS POLICY:
 - 30-day satisfaction guarantee
@@ -353,10 +460,11 @@ YOUR CAPABILITIES:
 7. Provide information about Dr. Taylor's books
 
 STRICT RULES — NEVER BREAK THESE:
+- NEVER say "virtual assistant" or "AI" — you are just Patrice
 - NEVER transfer a call or offer to connect to a human
 - NEVER share a physical address or give directions — this is an online-only supplement company
 - NEVER give out the business phone number
-- If caller wants to speak to a human: say "You can email our team at info at taylormdformulations.com and someone will follow up with you within 48 hours"
+- If caller wants to speak to a human: collect their name and contact info, then say our team will follow up within 48 hours
 - If caller is a sales rep or vendor: say "For business inquiries, please email info at taylormdformulations.com" then end the call politely
 - NEVER diagnose medical conditions — always frame as "supporting" or "helping with" symptoms
 - If asked for medical advice: say "I'm not able to give medical advice, but I can tell you which of our physician-formulated products may support those symptoms"
@@ -378,7 +486,7 @@ async function getAIResponse(callSid, callerSpeech, orderContext = null) {
   const sess = getSession(callSid);
   const openaiKey = CONFIG.openai.apiKey;
   if (!openaiKey) {
-    return deadEndMessage();
+    return "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours.";
   }
 
   sess.conversationHistory.push({ role: 'user', content: callerSpeech });
@@ -408,10 +516,10 @@ async function getAIResponse(callSid, callerSpeech, orderContext = null) {
       sess.conversationHistory.push({ role: 'assistant', content: reply });
       sess.callLog.push(`Patrice: ${reply.slice(0, 200)}`);
     }
-    return reply || deadEndMessage();
+    return reply || "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours.";
   } catch (err) {
     console.error('[AI] OpenAI error:', err.response?.data || err.message);
-    return deadEndMessage();
+    return "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours.";
   }
 }
 
@@ -434,25 +542,18 @@ function detectIntent(speech) {
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  service: 'Patrice — Taylor MD Formulations AI Receptionist v2.0',
+  service: 'Patrice — Taylor MD Formulations AI Receptionist v3.0',
   phone: CONFIG.twilio.phoneNumber,
+  version: '3.0',
 }));
-app.get('/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
 
-// ── Twilio status callback ────────────────────────────────────────────────────
-app.post('/status', async (req, res) => {
-  const { CallSid: callSid, CallStatus: status, From: callerPhone } = req.body;
-  console.log(`[STATUS] ${callSid}: ${status}`);
-  if (['completed', 'no-answer', 'busy', 'failed'].includes(status) && callSid) {
-    const sess = sessions[callSid];
-    if (sess && sess.callLog && sess.callLog.length > 0) {
-      const summary = sess.callLog.join('\n');
-      sendCallSummary(callerPhone || 'Unknown', summary).catch(() => {});
-      clearSession(callSid);
-    }
-  }
-  res.sendStatus(204);
-});
+app.get('/health', (req, res) => res.json({
+  status: 'healthy',
+  uptime: process.uptime(),
+  service: 'patrice-tmd',
+  version: '3.0',
+  timestamp: new Date().toISOString(),
+}));
 
 // ── INCOMING CALL GREETING ────────────────────────────────────────────────────
 app.post('/voice', (req, res) => {
@@ -461,39 +562,16 @@ app.post('/voice', (req, res) => {
   const callerPhone = req.body.From || 'anonymous';
   const sess        = getSession(callSid);
   sess.callerPhone  = callerPhone;
-  sess.callLog      = [];
+  sess.callLog      = [`[Call started: ${new Date().toISOString()} | From: ${callerPhone}]`];
   sess.conversationHistory = [];
   sess.noInputCount = 0;
+  sess.frustrationCount = 0;
+  sess.escalated = false;
   console.log(`[CALL] Incoming from ${callerPhone} | SID: ${callSid}`);
-  const greeting = "Thank you for calling Taylor MD Formulations! This is Patrice, your virtual assistant. I can help you with product questions, order status, pricing and savings, or anything about our physician-formulated supplements. How can I help you today?";
+
+  const greeting = "Thank you for calling Taylor MD Formulations! This is Patrice. I can help you with product questions, order status, pricing and savings, or anything about our physician-formulated supplements. How can I help you today?";
   const g = gather(twiml, '/respond', { timeout: 10, speechTimeout: '2' });
   say(g, greeting, callSid);
-  twiml.redirect('/no-input');
-  res.type('text/xml').send(twiml.toString());
-});
-
-// ── NO INPUT HANDLER ──────────────────────────────────────────────────────────
-app.post('/no-input', (req, res) => {
-  const twiml   = new VoiceResponse();
-  const callSid = req.body.CallSid;
-  const sess    = getSession(callSid);
-  sess.noInputCount = (sess.noInputCount || 0) + 1;
-
-  if (sess.noInputCount >= 3) {
-    // Three strikes — give email and hang up gracefully
-    say(twiml,
-      "I haven't been able to hear you — that's okay! You can reach us anytime by emailing info at taylormdformulations.com, " +
-      "or visit taylormdformulations.com. Our team will be happy to help. Thank you for calling, and have a wonderful day!",
-      callSid
-    );
-    twiml.hangup();
-    sendCallSummary(sess.callerPhone || 'Unknown', (sess.callLog || []).join('\n') + '\n[Call ended: no input after 3 attempts]').catch(() => {});
-    clearSession(callSid);
-    return res.type('text/xml').send(twiml.toString());
-  }
-
-  const g = gather(twiml, '/respond', { timeout: 10 });
-  say(g, "I'm here to help! You can ask me about our products, check an order, or ask about pricing and savings. What can I do for you?", callSid);
   twiml.redirect('/no-input');
   res.type('text/xml').send(twiml.toString());
 });
@@ -505,13 +583,29 @@ app.post('/respond', async (req, res) => {
   const callerPhone = req.body.From || 'anonymous';
   const speech      = (req.body.SpeechResult || '').trim();
   const sess        = getSession(callSid);
-  sess.noInputCount = 0; // reset on any speech
+  sess.noInputCount = 0;
 
   if (!speech) {
     const g = gather(twiml, '/respond', { timeout: 10 });
     say(g, "I didn't catch that — could you say that again?", callSid);
     twiml.redirect('/no-input');
     return res.type('text/xml').send(twiml.toString());
+  }
+
+  // Universal escape check first
+  const esc = checkEscape(speech, sess);
+  if (esc.triggered) {
+    if (esc.action === 'goodbye') {
+      say(twiml, "Thank you for calling Taylor MD Formulations! Have a wonderful day!", callSid);
+      twiml.hangup();
+      sendCallSummary({ callerPhone, transcript: sess.callLog.join('\n'), callSid }).catch(() => {});
+      clearSession(callSid);
+      return res.type('text/xml').send(twiml.toString());
+    }
+    if (esc.action === 'escalate' && !sess.escalated) {
+      buildEscalationResponse(twiml, callSid, `escape triggered by: "${speech.slice(0, 60)}"`);
+      return res.type('text/xml').send(twiml.toString());
+    }
   }
 
   const intent = detectIntent(speech);
@@ -522,7 +616,7 @@ app.post('/respond', async (req, res) => {
     say(twiml, "For business inquiries, please email us at info at taylormdformulations.com. Our team will review your inquiry and follow up within 48 hours. Thank you for calling!", callSid);
     sess.callLog.push('[Intent: sales call — redirected to email]');
     twiml.hangup();
-    sendCallSummary(callerPhone, sess.callLog.join('\n')).catch(() => {});
+    sendCallSummary({ callerPhone, transcript: sess.callLog.join('\n'), callSid }).catch(() => {});
     clearSession(callSid);
     return res.type('text/xml').send(twiml.toString());
   }
@@ -543,16 +637,8 @@ app.post('/respond', async (req, res) => {
   }
 
   // ── WANTS HUMAN ──────────────────────────────────────────────────────────
-  if (intent === 'human') {
-    say(twiml,
-      "I completely understand. You can reach our team directly by emailing info at taylormdformulations.com — " +
-      "that's info at taylor M D formulations dot com — and someone will follow up with you within 48 hours. " +
-      "Is there anything else I can help you with today?",
-      callSid
-    );
-    const g = gather(twiml, '/respond', { timeout: 8 });
-    say(g, '', callSid);
-    twiml.redirect('/no-input');
+  if (intent === 'human' && !sess.escalated) {
+    buildEscalationResponse(twiml, callSid, 'caller requested human');
     return res.type('text/xml').send(twiml.toString());
   }
 
@@ -631,7 +717,7 @@ app.post('/respond', async (req, res) => {
   if (intent === 'goodbye') {
     say(twiml, "Thank you for calling Taylor MD Formulations! Have a wonderful day!", callSid);
     twiml.hangup();
-    sendCallSummary(callerPhone, sess.callLog.join('\n')).catch(() => {});
+    sendCallSummary({ callerPhone, transcript: sess.callLog.join('\n'), callSid }).catch(() => {});
     clearSession(callSid);
     return res.type('text/xml').send(twiml.toString());
   }
@@ -660,7 +746,6 @@ app.post('/respond', async (req, res) => {
         say(g, aiReply, callSid);
         twiml.redirect('/no-input');
       } else {
-        // Order not found — dead end with email
         sess.callLog.push('[Order lookup: no results found]');
         say(twiml,
           "I wasn't able to find an order with that information. Please email us at info at taylormdformulations.com " +
@@ -673,7 +758,6 @@ app.post('/respond', async (req, res) => {
       }
       return res.type('text/xml').send(twiml.toString());
     } else {
-      // Ask for email or order number
       say(twiml, "I can look up your order! Could you please provide your email address or your order number? Order numbers start with T-M-D.", callSid);
       const g = gather(twiml, '/order-lookup', { timeout: 15, speechTimeout: '3' });
       say(g, '', callSid);
@@ -690,7 +774,7 @@ app.post('/respond', async (req, res) => {
     twiml.redirect('/no-input');
   } catch (err) {
     console.error('[RESPOND] AI error:', err.message);
-    say(twiml, deadEndMessage(), callSid);
+    say(twiml, "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours.", callSid);
     const g = gather(twiml, '/respond', { timeout: 8 });
     say(g, '', callSid);
     twiml.redirect('/no-input');
@@ -724,9 +808,8 @@ app.post('/order-lookup', async (req, res) => {
     lookupKey = emailMatch[0];
     orderData = await lookupOrderByEmail(lookupKey);
   } else {
-    // Cannot parse — dead end with email
     sess.callLog.push(`[Order lookup: could not parse input "${speech.slice(0, 80)}"]`);
-    say(twiml, deadEndMessage(), callSid);
+    say(twiml, "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours.", callSid);
     const g = gather(twiml, '/respond', { timeout: 8 });
     say(g, '', callSid);
     twiml.redirect('/no-input');
@@ -743,7 +826,6 @@ app.post('/order-lookup', async (req, res) => {
     say(g, aiReply, callSid);
     twiml.redirect('/no-input');
   } else {
-    // Not found — dead end with email
     sess.callLog.push(`[Order lookup for ${lookupKey}: not found]`);
     say(twiml,
       `I wasn't able to find an order for that information. Please email us at info at taylormdformulations.com ` +
@@ -755,6 +837,162 @@ app.post('/order-lookup', async (req, res) => {
     twiml.redirect('/no-input');
   }
   res.type('text/xml').send(twiml.toString());
+});
+
+// ── NO INPUT HANDLER ──────────────────────────────────────────────────────────
+app.post('/no-input', (req, res) => {
+  const twiml   = new VoiceResponse();
+  const callSid = req.body.CallSid;
+  const sess    = getSession(callSid);
+  sess.noInputCount = (sess.noInputCount || 0) + 1;
+
+  if (sess.noInputCount >= 3) {
+    say(twiml,
+      "I haven't been able to hear you — that's okay! You can reach us anytime by emailing info at taylormdformulations.com, " +
+      "or visit taylormdformulations.com. Our team will be happy to help. Thank you for calling, and have a wonderful day!",
+      callSid
+    );
+    twiml.hangup();
+    sendCallSummary({
+      callerPhone: sess.callerPhone || 'Unknown',
+      transcript: (sess.callLog || []).join('\n') + '\n[Call ended: no input after 3 attempts]',
+      callSid,
+    }).catch(() => {});
+    clearSession(callSid);
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  const g = gather(twiml, '/respond', { timeout: 10 });
+  say(g, "I'm here to help! You can ask me about our products, check an order, or ask about pricing and savings. What can I do for you?", callSid);
+  twiml.redirect('/no-input');
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── ESCALATION — collect caller name ─────────────────────────────────────────
+app.post('/escalation-name', async (req, res) => {
+  const twiml   = new VoiceResponse();
+  const callSid = req.body.CallSid;
+  const speech  = (req.body.SpeechResult || '').trim();
+  const sess    = getSession(callSid);
+
+  if (speech) {
+    sess.callerName = speech;
+    sess.callLog.push(`[Escalation - caller name: ${speech}]`);
+    const g = gather(twiml, '/escalation-phone', { timeout: 12, speechTimeout: '3' });
+    say(g, `Thank you, ${speech}. And what's the best phone number to reach you?`, callSid);
+    twiml.redirect('/no-input');
+  } else {
+    sess.callLog.push('[Escalation - name not captured]');
+    const g = gather(twiml, '/escalation-phone', { timeout: 12, speechTimeout: '3' });
+    say(g, "And what's the best phone number to reach you?", callSid);
+    twiml.redirect('/no-input');
+  }
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── ESCALATION — collect caller phone ────────────────────────────────────────
+app.post('/escalation-phone', async (req, res) => {
+  const twiml   = new VoiceResponse();
+  const callSid = req.body.CallSid;
+  const speech  = (req.body.SpeechResult || '').trim();
+  const sess    = getSession(callSid);
+
+  if (speech) {
+    sess.callerPhone = speech;
+    sess.callLog.push(`[Escalation - callback phone: ${speech}]`);
+  }
+
+  const g = gather(twiml, '/escalation-email', { timeout: 12, speechTimeout: '3' });
+  say(g, "And your email address?", callSid);
+  twiml.redirect('/no-input');
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── ESCALATION — collect caller email then wrap up ────────────────────────────
+app.post('/escalation-email', async (req, res) => {
+  const twiml   = new VoiceResponse();
+  const callSid = req.body.CallSid;
+  const speech  = (req.body.SpeechResult || '').trim();
+  const sess    = getSession(callSid);
+
+  if (speech) {
+    sess.callerEmail = speech;
+    sess.callLog.push(`[Escalation - email: ${speech}]`);
+  }
+
+  const name = sess.callerName ? `, ${sess.callerName}` : '';
+  say(twiml,
+    `Thank you${name}. I've noted your information and our team will follow up with you within 48 hours. ` +
+    "You can also email us directly at info at taylormdformulations.com or visit taylormdformulations.com. " +
+    "Thank you for calling Taylor MD Formulations, and have a wonderful day!",
+    callSid
+  );
+  twiml.hangup();
+
+  // Fire summary email
+  sendCallSummary({
+    callerPhone: sess.callerPhone || 'Unknown',
+    transcript: sess.callLog.join('\n'),
+    callSid,
+  }).catch(() => {});
+  clearSession(callSid);
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── POST-CALL STATUS CALLBACK (Twilio calls this after call ends) ─────────────
+app.post('/clinic/status', async (req, res) => {
+  const { CallSid: callSid, CallStatus: status, From: callerPhone, CallDuration: duration } = req.body;
+  console.log(`[STATUS] ${callSid}: ${status} | Duration: ${duration}s`);
+  res.sendStatus(204);
+
+  if (!['completed', 'no-answer', 'busy', 'failed'].includes(status)) return;
+
+  // 12-second delay to allow Twilio recording to finalize
+  setTimeout(async () => {
+    let recordingUrl = null;
+    try {
+      const client = getTwilioClient();
+      if (client && callSid) {
+        const recordings = await client.recordings.list({ callSid, limit: 1 });
+        if (recordings.length > 0) {
+          const rec = recordings[0];
+          recordingUrl = `https://api.twilio.com/2010-04-01/Accounts/${CONFIG.twilio.accountSid}/Recordings/${rec.sid}.mp3`;
+        }
+      }
+    } catch (e) {
+      console.warn('[STATUS] Recording fetch failed:', e.message);
+    }
+
+    const sess = sessions[callSid];
+    const transcript = sess ? sess.callLog.join('\n') : '[No transcript — session expired]';
+
+    // Save to persistent storage
+    saveTranscript({
+      timestamp: new Date().toISOString(),
+      callSid,
+      callerPhone: callerPhone || sess?.callerPhone || 'Unknown',
+      status,
+      duration,
+      recordingUrl,
+      transcript,
+    });
+
+    await sendCallSummary({
+      callerPhone: callerPhone || sess?.callerPhone || 'Unknown',
+      transcript,
+      recordingUrl,
+      duration,
+      callSid,
+    });
+
+    if (sess) clearSession(callSid);
+  }, 12000);
+});
+
+// ── RECORDING STATUS CALLBACK ─────────────────────────────────────────────────
+app.post('/recording-status', (req, res) => {
+  console.log(`[RECORDING] ${req.body.RecordingSid}: ${req.body.RecordingStatus}`);
+  res.sendStatus(204);
 });
 
 // ── CALL LOGS (admin) ─────────────────────────────────────────────────────────
@@ -779,6 +1017,60 @@ app.get('/call-logs', async (req, res) => {
   }
 });
 
+// ── TRANSCRIPT VIEWER (admin) ─────────────────────────────────────────────────
+app.get('/transcripts', (req, res) => {
+  try {
+    if (!fs.existsSync(TRANSCRIPT_FILE)) return res.json({ transcripts: [], count: 0 });
+    const lines = fs.readFileSync(TRANSCRIPT_FILE, 'utf8').trim().split('\n').filter(Boolean);
+    const limit = parseInt(req.query.limit) || 50;
+    const recent = lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    res.json({ transcripts: recent.reverse(), count: lines.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── SELF-PING WATCHDOG ───────────────────────────────────────────────────────
+let consecutiveFailures = 0;
+let serviceWasDown = false;
+
+async function selfPing() {
+  try {
+    const r = await axios.get(`${CONFIG.serviceUrl}/health`, { timeout: 10000 });
+    if (r.status === 200) {
+      if (serviceWasDown) {
+        serviceWasDown = false;
+        consecutiveFailures = 0;
+        console.log('[WATCHDOG] Service recovered');
+        // Recovery alert
+        const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+        sendEmail(
+          '✅ Patrice is back online',
+          `<p>Patrice (Taylor MD AI Receptionist) recovered at <strong>${now} ET</strong>.</p><p>Service URL: ${CONFIG.serviceUrl}</p>`,
+          `Patrice recovered at ${now} ET. URL: ${CONFIG.serviceUrl}`
+        ).catch(() => {});
+      } else {
+        consecutiveFailures = 0;
+      }
+    }
+  } catch (err) {
+    consecutiveFailures++;
+    console.warn(`[WATCHDOG] Ping failed (${consecutiveFailures}):`, err.message);
+    if (consecutiveFailures >= 3 && !serviceWasDown) {
+      serviceWasDown = true;
+      const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+      sendEmail(
+        '🚨 Patrice is DOWN',
+        `<p>Patrice (Taylor MD AI Receptionist) has been unreachable for ${consecutiveFailures} consecutive pings as of <strong>${now} ET</strong>.</p><p>Service URL: ${CONFIG.serviceUrl}</p><p>Check Railway dashboard immediately.</p>`,
+        `ALERT: Patrice is down as of ${now} ET. URL: ${CONFIG.serviceUrl}`
+      ).catch(() => {});
+    }
+  }
+}
+
+// Ping every 4 minutes to keep service warm and detect downtime
+setInterval(selfPing, 4 * 60 * 1000);
+
 // ─── GLOBAL ERROR GUARD ───────────────────────────────────────────────────────
 process.on('unhandledRejection', (reason) => {
   console.error('[Unhandled Rejection]', reason);
@@ -789,7 +1081,24 @@ process.on('uncaughtException', (err) => {
 
 // ─── START SERVER ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Patrice — Taylor MD Formulations AI Receptionist v2.0 running on port ${PORT}`);
+  console.log(`Patrice — Taylor MD Formulations AI Receptionist v3.0 running on port ${PORT}`);
+
+  // Startup confirmation email
+  const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  sendEmail(
+    '🟢 Patrice is online — Taylor MD AI Receptionist v3.0',
+    `<div style="font-family:Arial,sans-serif;max-width:600px;">
+      <h2 style="color:#1a6b4a;">🟢 Patrice Started Successfully</h2>
+      <p><strong>Time:</strong> ${now} ET</p>
+      <p><strong>Version:</strong> 3.0</p>
+      <p><strong>Phone:</strong> ${CONFIG.twilio.phoneNumber}</p>
+      <p><strong>Service URL:</strong> ${CONFIG.serviceUrl}</p>
+      <p><strong>Health Check:</strong> <a href="${CONFIG.serviceUrl}/health">${CONFIG.serviceUrl}/health</a></p>
+      <hr/>
+      <p style="color:#718096;font-size:12px;">Patrice is ready to handle calls for Taylor MD Formulations.</p>
+    </div>`,
+    `Patrice v3.0 started at ${now} ET | Phone: ${CONFIG.twilio.phoneNumber} | URL: ${CONFIG.serviceUrl}`
+  ).catch(() => {});
 });
 
 module.exports = app;
