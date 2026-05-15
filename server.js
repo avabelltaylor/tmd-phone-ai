@@ -207,63 +207,57 @@ function formatStatus(status) {
 
 // ─── PRODUCT CATALOG (KNOWLEDGE BASE) ────────────────────────────────────────
 const PRODUCT_CATALOG = `
-TAYLOR MD FORMULATIONS — FULL PRODUCT CATALOG
+TAYLOR MD FORMULATIONS — LIVE PRODUCT CATALOG (as of 2026)
 
-HORMONE & ADRENAL SUPPORT:
-- AdrenaCare™ ($69.95): Comprehensive adrenal support. Helps with: fatigue, adrenal exhaustion, low cortisol, burnout, chronic stress, low energy, hormonal imbalance
-- SerenCalm™ ($38.95): Lower cortisol, clear brain fog, think sharper. Helps with: high cortisol, brain fog, anxiety, stress, poor memory, scattered thinking
-- Stress B Complex™ ($37.95): High-potency B vitamins for stress. Helps with: stress, fatigue, B vitamin deficiency, low energy, nerve pain, mood issues, anxiety, depression
-- Hormony Pro™ ($59.95): Natural hormone balance without a prescription. Helps with: hormone imbalance, menopause, perimenopause, hot flashes, night sweats, PMS, estrogen dominance, low progesterone
-- LibidoRx™ ($49.95): Restore desire and enhance intimacy naturally. Helps with: low libido, low sex drive, sexual dysfunction, hormonal low desire, menopause libido
+ADRENAL SUPPORT:
+- AdrenaCare™ ($69.95): Restore Your Adrenal Function. Reclaim Your Energy. Helps with: adrenal fatigue, burnout, low energy, chronic stress, adrenal exhaustion, cortisol depletion
+- SerenCalm™ ($38.95): Lower Cortisol. Clear Brain Fog. Think Sharper. Helps with: high cortisol, brain fog, anxiety, stress, poor memory, scattered thinking, mental clarity
+- Stress B Complex™ ($37.95): The B Vitamins Your Stressed Body Is Burning Through. Helps with: stress, fatigue, B vitamin deficiency, low energy, nerve pain, mood issues, anxiety, depression
+
+WOMEN'S HEALTH / HORMONE:
+- LaiDex™ ($36.95): End Hot Flashes. Balance Hormones. Feel Like Yourself Again. Helps with: hot flashes, night sweats, menopause, perimenopause, hormone imbalance, sleep disruption
+- Hormony Pro™ ($59.95): Bioidentical Progesterone. Real Hormone Balance. Helps with: PMS, bloating, mood swings, cramps, low progesterone, estrogen dominance, perimenopause
+- Thyroid Support™ ($35.95): Support Your Thyroid. Restore Your Metabolism. Helps with: hypothyroid, slow metabolism, weight gain, hair loss, cold intolerance, fatigue, brain fog, constipation
 
 BRAIN & COGNITIVE:
-- CogHealth™ ($59.95): Sharpen focus, protect memory, prevent cognitive decline. Helps with: brain fog, memory loss, poor focus, cognitive decline, ADHD, mental fatigue, concentration problems
-- NeuroCalmRx™ ($49.95): Calm the nervous system, reduce anxiety, restore balance. Helps with: anxiety, panic attacks, nervous system dysregulation, PTSD, hypervigilance, emotional dysregulation
+- CogHealth™ ($34.95): Advanced Cognitive Support for Memory, Focus, and Brain Longevity. Helps with: brain fog, memory loss, poor focus, cognitive decline, ADHD, mental fatigue
+- Sertona™ ($36.95): Natural Serotonin Support for Mood, Calm, and Emotional Balance. Helps with: low mood, depression, anxiety, emotional imbalance, serotonin deficiency, mood swings
 
 SLEEP:
-- SleepEasy™ ($38.95): Fall asleep faster, stay asleep longer, wake up restored. Helps with: insomnia, poor sleep, trouble falling asleep, waking at night, sleep anxiety, racing mind at bedtime
+- SleepEasy™ ($34.95): Deep, Restorative Sleep — Without Dependency or Grogginess. Helps with: insomnia, poor sleep, trouble falling asleep, waking at night, sleep anxiety, racing mind
 
 GUT & DIGESTIVE HEALTH:
-- Flora Repair™ ($36.95): 30 Billion CFU probiotic for real gut balance. Helps with: gut imbalance, bloating, digestive issues, immune weakness, inflammation, IBS, after antibiotics, leaky gut
-- Paradix™ ($34.95): Digestive enzymes that actually work. Helps with: bloating after meals, gas, indigestion, food sensitivities, GERD, poor nutrient absorption
-- Enzyme Restore™ ($44.95): Heal gut lining and restore digestive integrity. Helps with: leaky gut, intestinal permeability, food sensitivities, autoimmune conditions, gut inflammation, IBS, Crohn's
-- GreenMed Rx™ ($42.95): Detox, alkalize, flood your body with phytonutrients. Helps with: toxin buildup, poor gut health, inflammation, low energy, liver stress, weight gain
-
-METABOLISM & WEIGHT:
-- Metabolic Rx™ ($49.95): Accelerate fat burning, regulate blood sugar, boost metabolism. Helps with: weight gain, slow metabolism, insulin resistance, blood sugar issues, belly fat, sugar cravings, pre-diabetes
-- Thyroid Support™ ($39.95): Nourish your thyroid, restore your metabolism. Helps with: hypothyroid, slow metabolism, weight gain, hair loss, cold intolerance, fatigue, brain fog, constipation
-- Amino Restore™ ($49.95): Rebuild muscle, accelerate recovery, preserve lean mass. Helps with: muscle loss, slow recovery, low muscle mass, post-workout soreness, body composition
+- Flora Repair™ ($36.95): 30 Billion CFU. Real Gut Balance. Real Results. Helps with: gut imbalance, bloating, digestive issues, immune weakness, IBS, after antibiotics, leaky gut
+- GreenMed Rx™ ($38.95): Alkalize. Detoxify. Energize. In One Daily Scoop. Helps with: toxin buildup, poor gut health, inflammation, low energy, liver stress, weight gain, detox
+- Paradix™ ($37.95): Heal Your Gut Lining. End Digestive Suffering. Helps with: leaky gut, IBS, intestinal permeability, food sensitivities, autoimmune gut conditions, bloating, cramping
+- Enzyme Restore™ ($35.95): Digest Your Food. Absorb Your Nutrients. End the Bloat. Helps with: bloating after meals, gas, indigestion, poor nutrient absorption, food sensitivities, GERD
 
 HEART & CARDIOVASCULAR:
-- Heart Guard™ ($49.95): Protect your heart, lower inflammation, support circulation. Helps with: heart disease risk, high blood pressure, high cholesterol, poor circulation, cardiovascular health
-- CoQ10 200mg™ ($34.95): Cellular energy, heart protection, statin support. Helps with: fatigue, heart disease, statin side effects, muscle pain from statins, low cellular energy
-- Mega EPA/DHA 3400™ ($26.95): The omega-3 dose that actually makes a difference. Helps with: high triglycerides, heart disease risk, inflammation, joint pain, brain fog, dry skin
+- Mega EPA/DHA 3400™ ($26.95): The Omega-3 Dose That Actually Makes a Difference. Helps with: high triglycerides, heart disease risk, inflammation, joint pain, brain fog, dry skin, cardiovascular health
 
-IMMUNE & BONE:
-- Immune Shield™ ($39.95): Fortify your immune system year-round. Helps with: frequent colds, weak immunity, slow recovery from illness, autoimmune support, seasonal allergies
-- Bone Density™ ($39.95): Build stronger bones, prevent osteoporosis. Helps with: osteoporosis, osteopenia, bone loss, fracture risk, menopause bone loss, calcium deficiency
-- BioFlav C 2000™ ($29.95): 2,000mg Vitamin C with bioflavonoids. Helps with: frequent illness, weak immune system, slow wound healing, oxidative stress, collagen loss
+WEIGHT MANAGEMENT / METABOLISM:
+- Amino Restore Vanilla™ ($51.95): Physician-Formulated Protein for Muscle, Metabolism, and Recovery. Helps with: muscle loss, slow recovery, low muscle mass, post-workout soreness, body composition, weight loss
+- Amino Restore Chocolate™ ($51.95): Physician-Formulated Chocolate Protein for Muscle, Metabolism, and Hormones. Same benefits as Vanilla — chocolate flavor option.
+- MIC•B Rx™ ($38.95): Physician-Formulated Blood Sugar and Glucose Metabolism Support. Helps with: blood sugar spikes, insulin resistance, pre-diabetes, weight gain, metabolic syndrome
+- MCT Oil Rx™ ($27.95): Clean Brain Fuel. Instant Energy. Fat Burning Support. Helps with: brain fog, low energy, weight management, ketone production, mental clarity, fat burning
 
-SKIN, HAIR & NAILS:
-- Skin Glow™ ($44.95): Collagen, hyaluronic acid, biotin — glow from within. Helps with: dry skin, aging skin, wrinkles, hair loss, brittle nails, skin aging, collagen loss
+HAIR HEALTH:
+- Genesis™ Hair Oil ($36.95): Physician-Formulated Topical Support for Thinning Hair and Hair Loss. Helps with: hair thinning, hair loss, DHT-related hair loss, follicle stimulation
 
-FOUNDATIONAL SUPPLEMENTS:
-- MaxHealth Multivitamin™ ($44.95): The complete daily foundation. Helps with: nutritional gaps, general wellness, fatigue, immune support, daily foundation
-- Vitamin D3/K2™ ($24.95): Vitamin D deficiency solution with K2 for safety. Helps with: vitamin D deficiency, bone loss, immune weakness, depression, fatigue, muscle weakness
-- Magnesium Glycinate™ ($28.95): The most deficient mineral in America, replenished. Helps with: muscle cramps, poor sleep, anxiety, constipation, headaches, migraines, high blood pressure
-- Iron Plus™ ($29.95): Non-constipating iron with Vitamin C for absorption. Helps with: iron deficiency, anemia, fatigue, hair loss, pale skin, shortness of breath, restless legs
+VITAMINS & MINERALS:
+- Vitamin D3 10,000 IU™ ($26.95): The Vitamin Deficiency That Affects Everything — Finally Fixed. Helps with: vitamin D deficiency, bone loss, immune weakness, depression, fatigue, muscle weakness
+- MaxHealth Multivitamin™ ($34.95): The Multivitamin That Actually Gets Absorbed. Helps with: nutritional gaps, general wellness, fatigue, immune support, daily foundation
+- BioFlav C 2000™ ($36.95): High-Potency Vitamin C with Bioflavonoids for Maximum Absorption. Helps with: frequent illness, weak immune system, slow wound healing, oxidative stress, collagen loss
 
-JOINT & PAIN:
-- Joint Flex™ ($44.95): Move without pain, rebuild cartilage, reduce inflammation. Helps with: joint pain, arthritis, knee pain, hip pain, back pain, stiffness, cartilage loss
+PAIN RELIEF:
+- Hemp Extract Cream™ ($69.95): Physician-Formulated Topical Relief for Muscles, Joints & Inflammation. Helps with: muscle pain, joint pain, inflammation, arthritis, topical pain relief
 
 DR. TAYLOR'S BOOKS:
-- "Are Your Hormones Making You Sick?" by Dr. Eldred B. Taylor & Dr. Ava Bell-Taylor ($15.00): A woman's guide to better health through hormonal balance. Covers estrogen dominance, progesterone deficiency, hormonal weight gain, mood swings, fatigue, hot flashes, menopause, PCOS.
-- "The Stress Connection" by Dr. Eldred B. Taylor & Dr. Ava Bell-Taylor ($15.00): 2nd edition. Explains how chronic stress, adrenal dysfunction, and cortisol imbalance drive a wide range of symptoms — and how to restore balance.
+- "Are Your Hormones Making You Sick?" by Dr. Ava Bell-Taylor, M.D. ($15.00): A woman's guide to better health through hormonal balance. Covers estrogen dominance, progesterone deficiency, hormonal weight gain, mood swings, fatigue, hot flashes, menopause, PCOS.
+- "The Stress Connection" by Dr. Ava Bell-Taylor, M.D. ($15.00): 2nd edition. Explains how chronic stress, adrenal dysfunction, and cortisol imbalance drive a wide range of symptoms — and how to restore balance.
 
 SHIPPING POLICY:
 - Free shipping on orders over $75
-- Standard shipping: $6.95
-- Express shipping: $19.95
 - Ships within 2-3 business days
 - Order number format: TMD-XXXXXXXXXX
 
@@ -274,7 +268,7 @@ RETURNS POLICY:
 
 ALL PRODUCTS:
 - Physician-formulated by Dr. Ava Bell-Taylor, M.D. and Dr. Eldred B. Taylor, M.D.
-- GMP certified
+- FDA Registered Facility, GMP Certified, NSF Certified
 - Available at taylormdformulations.com
 `;
 
