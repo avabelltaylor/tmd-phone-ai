@@ -314,6 +314,38 @@ async function lookupOrderByEmail(email) {
   }
 }
 
+async function lookupOrderByPhone(phone) {
+  const auth = ssAuth();
+  if (!auth) return null;
+  try {
+    // Normalize phone to digits only, then try with and without country code
+    const digits = phone.replace(/\D/g, '');
+    const e164 = digits.length === 10 ? `+1${digits}` : `+${digits}`;
+    const r = await axios.get('https://ssapi.shipstation.com/orders', {
+      headers: { Authorization: auth },
+      params: { customerName: '', pageSize: 50, sortBy: 'OrderDate', sortDir: 'DESC' },
+      timeout: 8000,
+    });
+    const orders = r.data?.orders || [];
+    // ShipStation doesn't have a direct phone filter — search by matching phone in customer data
+    const matched = orders.filter(o => {
+      const billPhone = (o.billTo?.phone || '').replace(/\D/g, '');
+      const shipPhone = (o.shipTo?.phone || '').replace(/\D/g, '');
+      return billPhone.endsWith(digits.slice(-10)) || shipPhone.endsWith(digits.slice(-10));
+    });
+    if (!matched.length) return null;
+    return matched.slice(0, 3).map(o => ({
+      orderNumber: o.orderNumber,
+      status: formatStatus(o.orderStatus),
+      date: o.orderDate ? o.orderDate.split('T')[0] : 'Unknown',
+      trackingNumber: o.shipments?.[0]?.trackingNumber || o.trackingNumber || null,
+    }));
+  } catch (err) {
+    console.error('[SS] Phone lookup failed:', err.message);
+    return null;
+  }
+}
+
 async function lookupOrderByNumber(orderNumber) {
   const auth = ssAuth();
   if (!auth) return null;
@@ -796,23 +828,70 @@ app.post('/order-lookup', async (req, res) => {
     return res.type('text/xml').send(twiml.toString());
   }
 
-  const emailMatch = speech.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/);
+  // ── Parse spoken email: "info at taylormdformulations dot com" → "info@taylormdformulations.com"
+  function parseSpokenEmail(text) {
+    // First try literal @ symbol
+    const literal = text.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/);
+    if (literal) return literal[0];
+    // Try spoken format: "word at word dot com"
+    const spoken = text
+      .replace(/\s+at\s+/gi, '@')
+      .replace(/\s+dot\s+/gi, '.')
+      .replace(/\s+/g, '');
+    const parsed = spoken.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/);
+    return parsed ? parsed[0] : null;
+  }
+
+  // ── Parse spoken phone: extract 10-digit US number from speech
+  function parseSpokenPhone(text) {
+    const digits = text.replace(/\D/g, '');
+    // Accept 10-digit or 11-digit (with leading 1)
+    if (digits.length === 10) return digits;
+    if (digits.length === 11 && digits[0] === '1') return digits.slice(1);
+    return null;
+  }
+
   const orderMatch = speech.match(/TMD[-\s]?[A-Z0-9]{6,}/i);
+  const emailParsed = parseSpokenEmail(speech);
+  const phoneParsed = parseSpokenPhone(speech);
   let orderData = null;
   let lookupKey = '';
+  let lookupMethod = '';
 
   if (orderMatch) {
     lookupKey = orderMatch[0].replace(/\s/g, '').toUpperCase();
+    lookupMethod = 'order number';
     orderData = await lookupOrderByNumber(lookupKey);
-  } else if (emailMatch) {
-    lookupKey = emailMatch[0];
+  } else if (emailParsed) {
+    lookupKey = emailParsed.toLowerCase();
+    lookupMethod = 'email';
     orderData = await lookupOrderByEmail(lookupKey);
+  } else if (phoneParsed) {
+    lookupKey = phoneParsed;
+    lookupMethod = 'phone number';
+    orderData = await lookupOrderByPhone(lookupKey);
   } else {
+    // Could not parse — reprompt clearly instead of giving up
     sess.callLog.push(`[Order lookup: could not parse input "${speech.slice(0, 80)}"]`);
-    say(twiml, "I want to make sure you get the help you need. Please email us at info at taylormdformulations.com and our team will follow up with you within 48 hours.", callSid);
-    const g = gather(twiml, '/respond', { timeout: 8 });
-    say(g, '', callSid);
-    twiml.redirect('/no-input');
+    sess.orderLookupRetry = (sess.orderLookupRetry || 0) + 1;
+    if (sess.orderLookupRetry >= 2) {
+      say(twiml,
+        "No problem at all. I'll flag this for our team. Please email us at info at taylormdformulations.com " +
+        "with your name and order details and we'll follow up within 24 hours. Is there anything else I can help you with?",
+        callSid
+      );
+      const g = gather(twiml, '/respond', { timeout: 8 });
+      say(g, '', callSid);
+      twiml.redirect('/no-input');
+    } else {
+      const g = gather(twiml, '/order-lookup', { timeout: 15, speechTimeout: '3' });
+      say(g,
+        "I want to make sure I find your order. You can give me your order number — it starts with T-M-D — " +
+        "your email address, or the phone number on your account. Which would you like to use?",
+        callSid
+      );
+      twiml.redirect('/no-input');
+    }
     return res.type('text/xml').send(twiml.toString());
   }
 
